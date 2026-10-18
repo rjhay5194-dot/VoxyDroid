@@ -31,7 +31,7 @@ jobs:
               id 'fabric-loom' version '1.14-SNAPSHOT'
           }
 
-          version = '0.1.0'
+          version = '0.2.0'
           group = 'voxylod'
           base { archivesName = 'voxylod' }
 
@@ -78,7 +78,7 @@ jobs:
           {
             "schemaVersion": 1,
             "id": "voxylod",
-            "version": "0.1.0",
+            "version": "0.2.0",
             "name": "VoxyLod",
             "description": "Voxel LOD terrain with real block textures, built for low-end Android GPUs.",
             "environment": "client",
@@ -165,7 +165,6 @@ jobs:
           import net.fabricmc.loader.api.FabricLoader;
           import net.minecraft.client.Minecraft;
           import net.minecraft.client.multiplayer.ClientLevel;
-          import net.minecraft.client.renderer.RenderPipelines;
           import net.minecraft.client.renderer.texture.AbstractTexture;
           import net.minecraft.client.renderer.texture.TextureAtlas;
           import net.minecraft.core.Direction;
@@ -178,7 +177,10 @@ jobs:
           import net.minecraft.world.level.block.state.BlockState;
           import net.minecraft.world.level.chunk.LevelChunk;
           import net.minecraft.world.level.chunk.LevelChunkSection;
+          import net.minecraft.world.level.levelgen.Heightmap;
           import net.minecraft.world.phys.Vec3;
+          import net.minecraft.client.renderer.RenderPipelines;
+          import org.joml.FrustumIntersection;
           import org.joml.Matrix4f;
           import org.joml.Vector3f;
           import org.joml.Vector4f;
@@ -197,9 +199,8 @@ jobs:
           import java.util.concurrent.atomic.AtomicInteger;
 
           /**
-           * VoxyLod build 1: voxel LOD terrain with real block textures, drawn with plain
-           * vertex buffers (no compute shaders, no indirect draws) so it can run on GLES-class GPUs.
-           * Stored resolution is 2 blocks per voxel; far columns are meshed at 4, 8 and 16 blocks per voxel.
+           * VoxyLod build 2: full-resolution voxel LOD (1 block = 1 voxel near, 2/4/8 blocks farther out)
+           * with real block textures, drawn with plain vertex buffers (no compute shaders, no indirect draws).
            */
           public class VoxyLodMod implements ClientModInitializer {
               public static final String ID = "voxylod";
@@ -207,13 +208,23 @@ jobs:
               // ---------------------------------------------------------------- config
               public static final class Config {
                   public boolean enabled = true;
-                  public int distanceChunks = 32;   // how far LOD is drawn (chunks)
-                  public int ramBudgetMb = 96;      // memory for stored LOD voxels
-                  public int detailBias = 0;        // -1 sharper, +1 coarser
+                  public int distanceChunks = 32;    // how far LOD is drawn (chunks)
+                  public int ramBudgetMb = 96;       // memory for stored LOD voxels
+                  public int detailBias = 0;         // -1 sharper, +1/+2 coarser
+                  public int fullDetailChunks = 6;   // chunks beyond vanilla distance drawn at 1 block per voxel
+                  public int surfaceDepth = 32;      // blocks below the surface that are stored
+                  public boolean disableFog = true;  // remove vanilla fog while LOD is on
               }
               static Config cfg = new Config();
               static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
               static Path cfgPath() { return FabricLoader.getInstance().getConfigDir().resolve("voxylod.json"); }
+              static void clampCfg() {
+                  cfg.distanceChunks = Math.max(4, Math.min(128, cfg.distanceChunks));
+                  cfg.ramBudgetMb = Math.max(16, Math.min(1024, cfg.ramBudgetMb));
+                  cfg.detailBias = Math.max(-1, Math.min(2, cfg.detailBias));
+                  cfg.fullDetailChunks = Math.max(0, Math.min(24, cfg.fullDetailChunks));
+                  cfg.surfaceDepth = Math.max(8, Math.min(128, cfg.surfaceDepth));
+              }
               static void loadCfg() {
                   try {
                       Path p = cfgPath();
@@ -224,8 +235,7 @@ jobs:
                           }
                       }
                   } catch (Exception e) { System.err.println("[voxylod] config load failed: " + e); }
-                  cfg.distanceChunks = Math.max(4, Math.min(128, cfg.distanceChunks));
-                  cfg.ramBudgetMb = Math.max(16, Math.min(1024, cfg.ramBudgetMb));
+                  clampCfg();
                   saveCfg();
               }
               static void saveCfg() {
@@ -237,11 +247,16 @@ jobs:
               // id 0 = air / not drawn. Ids are shared by every column.
               static final List<BlockState> PAL = new ArrayList<>();
               static final Map<BlockState, Short> PAL_IDS = new HashMap<>();
-              static final Map<BlockState, Short> CLASS_CACHE = new HashMap<>();
+              static final Map<BlockState, Short> CLASS_CACHE = new ConcurrentHashMap<>();
               static { PAL.add(Blocks.AIR.defaultBlockState()); }
 
+              static short classify(BlockState s) {
+                  Short c = CLASS_CACHE.get(s);
+                  return c != null ? c : classifySlow(s);
+              }
+
               /** Maps a real block state to a palette id, or 0 if it should not appear in the LOD. */
-              static synchronized short classify(BlockState s) {
+              static synchronized short classifySlow(BlockState s) {
                   Short c = CLASS_CACHE.get(s);
                   if (c != null) return c;
                   short r = 0;
@@ -267,18 +282,73 @@ jobs:
               }
               static synchronized BlockState stateOf(int id) { return PAL.get(id); }
 
-              // ---------------------------------------------------------------- columns
-              /** One 16x16 chunk column stored at 2 blocks per voxel: index = (y*8 + z)*8 + x. */
+              static volatile short fillIdCache = -1;
+              /** Block used for everything deeper than the stored surface band. */
+              static short fillId() {
+                  if (fillIdCache < 0) fillIdCache = classify(Blocks.STONE.defaultBlockState());
+                  return fillIdCache;
+              }
+
+              // ---------------------------------------------------------------- section + column storage
+              /** One 16x16x16 section, palette-packed. Index = (y*16 + z)*16 + x. */
+              static final class Sec {
+                  final short[] pal; final byte[] idx; final short[] wide;
+                  Sec(short[] pal, byte[] idx, short[] wide) { this.pal = pal; this.idx = idx; this.wide = wide; }
+                  static Sec uniform(short id) { return new Sec(new short[]{id}, null, null); }
+                  static Sec of(short[] raw) {
+                      short[] tmp = new short[256];
+                      byte[] idx = new byte[4096];
+                      int cnt = 0;
+                      for (int i = 0; i < 4096; i++) {
+                          short v = raw[i];
+                          int k = -1;
+                          for (int j = 0; j < cnt; j++) if (tmp[j] == v) { k = j; break; }
+                          if (k < 0) {
+                              if (cnt == 256) return new Sec(null, null, raw);   // too many different blocks: store wide
+                              tmp[cnt] = v;
+                              k = cnt++;
+                          }
+                          idx[i] = (byte) k;
+                      }
+                      if (cnt == 1) return uniform(tmp[0]);
+                      return new Sec(Arrays.copyOf(tmp, cnt), idx, null);
+                  }
+                  boolean allAir() { return wide == null && idx == null && pal[0] == 0; }
+                  short get(int i) {
+                      if (wide != null) return wide[i];
+                      if (idx == null) return pal[0];
+                      return pal[idx[i] & 255];
+                  }
+                  int bytes() { return 48 + (pal != null ? pal.length * 2 : 0) + (idx != null ? 4096 : 0) + (wide != null ? 8192 : 0); }
+              }
+
+              /** One 16x16 chunk column. Sections below `lo` are all filler stone, above `hi` all air, null = air. */
               static final class Col {
-                  final int cx, cz, minY, h2;
-                  final short[] v;
-                  volatile int meshedLevel = -1;   // level of the mesh currently on the GPU
+                  final int cx, cz, minY, lo, hi;
+                  final Sec[] secs;
+                  final short fill;
+                  final long bytes;
+                  volatile int meshedLevel = -1;   // level of the mesh currently on the GPU (-2 = needs remesh)
                   volatile int queuedLevel = -1;   // level currently being meshed
                   volatile PendingMesh pending;    // finished mesh waiting for upload
                   GpuBuffer vb;
                   int quads;
-                  Col(int cx, int cz, int minY, int h2, short[] v) { this.cx = cx; this.cz = cz; this.minY = minY; this.h2 = h2; this.v = v; }
-                  long bytes() { return v.length * 2L; }
+                  Col(int cx, int cz, int minY, int lo, int hi, Sec[] secs, short fill) {
+                      this.cx = cx; this.cz = cz; this.minY = minY; this.lo = lo; this.hi = hi; this.secs = secs; this.fill = fill;
+                      long b = 96;
+                      for (Sec s : secs) if (s != null) b += s.bytes();
+                      this.bytes = b;
+                  }
+                  /** Voxel at column-local x/z (0..15) and world y. */
+                  short get(int lx, int wy, int lz) {
+                      int rel = wy - minY;
+                      int si = rel >> 4;
+                      if (si < lo) return fill;
+                      if (si > hi) return 0;
+                      Sec s = secs[si];
+                      if (s == null) return 0;
+                      return s.get(((rel & 15) * 16 + lz) * 16 + lx);
+                  }
                   void freeGpu() { if (vb != null) { vb.close(); vb = null; } quads = 0; meshedLevel = -1; }
               }
               static final class PendingMesh {
@@ -290,50 +360,92 @@ jobs:
               static long key(int x, int z) { return ((long) x << 32) ^ (z & 0xffffffffL); }
               static long ramUsed = 0;
 
-              // ---------------------------------------------------------------- ingest
+              // ---------------------------------------------------------------- incremental ingest
               static final ConcurrentLinkedQueue<LevelChunk> INGEST = new ConcurrentLinkedQueue<>();
               static ClientLevel lastLevel;
+              static Job curJob;
 
-              static Col ingest(ClientLevel level, LevelChunk ch) {
-                  int minY = level.getMinY();
-                  int h = level.getHeight();
-                  int h2 = (h + 1) / 2;
-                  short[] v = new short[64 * h2];
-                  LevelChunkSection[] secs = ch.getSections();
-                  boolean any = false;
-                  for (int si = 0; si < secs.length; si++) {
-                      LevelChunkSection sec = secs[si];
-                      if (sec == null || sec.hasOnlyAir()) continue;
-                      int cellBase = si * 8;
-                      for (int cy = 0; cy < 8; cy++) {
-                          int gy = cellBase + cy;
-                          if (gy >= h2) break;
-                          for (int cz = 0; cz < 8; cz++) {
-                              for (int cxx = 0; cxx < 8; cxx++) {
-                                  short id = 0;
-                                  scan:
-                                  for (int dy = 1; dy >= 0; dy--) {
-                                      for (int dz = 0; dz < 2; dz++) {
-                                          for (int dx = 0; dx < 2; dx++) {
-                                              BlockState s = sec.getBlockState(cxx * 2 + dx, cy * 2 + dy, cz * 2 + dz);
-                                              id = classify(s);
-                                              if (id != 0) break scan;
-                                          }
-                                      }
-                                  }
-                                  if (id != 0) { v[(gy * 8 + cz) * 8 + cxx] = id; any = true; }
+              /** Reads one chunk into LOD storage one section per step so the game never stalls. */
+              static final class Job {
+                  final LevelChunk ch;
+                  final int minY, n, depth;
+                  final int[] h = new int[256];
+                  final Sec[] secs;
+                  int minH, maxH, next = 0, lo = -1, hi = -1;
+
+                  Job(ClientLevel level, LevelChunk ch) {
+                      this.ch = ch;
+                      this.minY = level.getMinY();
+                      this.n = ch.getSectionsCount();
+                      this.secs = new Sec[n];
+                      this.depth = cfg.surfaceDepth;
+                      int mn = Integer.MAX_VALUE, mx = Integer.MIN_VALUE;
+                      for (int z = 0; z < 16; z++) {
+                          for (int x = 0; x < 16; x++) {
+                              int v = ch.getHeight(Heightmap.Types.WORLD_SURFACE, x, z);
+                              if (v < minY) v = minY;
+                              h[z * 16 + x] = v;
+                              mn = Math.min(mn, v);
+                              mx = Math.max(mx, v);
+                          }
+                      }
+                      minH = mn; maxH = mx;
+                  }
+
+                  /** Processes one section. Returns true when the whole chunk has been read. */
+                  boolean step() {
+                      if (next >= n) return true;
+                      int si = next++;
+                      int sMin = minY + si * 16, sMax = sMin + 15;
+                      if (sMin > maxH + 2) return next >= n;                  // above the surface: air
+                      if (sMax < minH - depth - 2) return next >= n;          // far below the surface: filler
+                      if (lo < 0) lo = si;
+                      LevelChunkSection sec = ch.getSection(si);
+                      if (sec == null || sec.hasOnlyAir()) return next >= n;
+                      short[] raw = new short[4096];
+                      short fill = fillId();
+                      for (int ly = 0; ly < 16; ly++) {
+                          int y = sMin + ly;
+                          for (int lz = 0; lz < 16; lz++) {
+                              for (int lx = 0; lx < 16; lx++) {
+                                  int i = (ly * 16 + lz) * 16 + lx;
+                                  if (y < h[lz * 16 + lx] - depth) raw[i] = fill;
+                                  else raw[i] = classify(sec.getBlockState(lx, ly, lz));
                               }
                           }
                       }
+                      Sec s = Sec.of(raw);
+                      if (!s.allAir()) { secs[si] = s; hi = si; }
+                      return next >= n;
                   }
-                  if (!any) return null;
-                  return new Col(ch.getPos().x, ch.getPos().z, minY, h2, v);
+
+                  Col finish() {
+                      if (hi < 0 || lo < 0) return null;
+                      return new Col(ch.getPos().x, ch.getPos().z, minY, lo, hi, secs, fillId());
+                  }
+              }
+
+              static void publish(Job j) {
+                  Col nc = j.finish();
+                  int cx = j.ch.getPos().x, cz = j.ch.getPos().z;
+                  long k = key(cx, cz);
+                  Col old = (nc == null) ? COLS.remove(k) : COLS.put(k, nc);
+                  if (old != null) { ramUsed -= old.bytes; old.freeGpu(); }
+                  if (nc != null) {
+                      ramUsed += nc.bytes;
+                      // neighbours were meshed without this column: remesh them so border faces are right
+                      for (int d = 0; d < 4; d++) {
+                          Col nb = COLS.get(key(cx + (d == 0 ? 1 : d == 1 ? -1 : 0), cz + (d == 2 ? 1 : d == 3 ? -1 : 0)));
+                          if (nb != null && nb.meshedLevel >= 0) nb.meshedLevel = -2;
+                      }
+                  }
               }
 
               static void clearAll() {
                   for (Col c : COLS.values()) c.freeGpu();
                   COLS.clear();
                   INGEST.clear();
+                  curJob = null;
                   ramUsed = 0;
               }
 
@@ -420,7 +532,10 @@ jobs:
                   }
               }
 
-              /** Value at grid cell (x,y,z) of column c at level L. -1 = solid and hidden, 0 = air, >0 = block id. */
+              /**
+               * Value at grid cell (x,y,z) of column c at level L (grid rows start at section c.lo).
+               * -1 = solid and hidden, 0 = air, >0 = block id.
+               */
               static short at(Col c, short[] g, int n, int m, int s, int x, int y, int z) {
                   if (y < 0) return -1;
                   if (y >= m) return 0;
@@ -429,34 +544,56 @@ jobs:
                   if (nc == null) return 0;
                   int lx = (((x % n) + n) % n) * s;
                   int lz = (((z % n) + n) % n) * s;
-                  int yy = Math.min(y * s, nc.h2 - 1);
-                  return nc.v[(yy * 8 + lz) * 8 + lx];
+                  return nc.get(lx, c.minY + c.lo * 16 + y * s, lz);
               }
 
               static PendingMesh mesh(Col c, int L) {
-                  final int s = 1 << L;
-                  final int n = Math.max(1, 8 >> L);
-                  final int m = (c.h2 + s - 1) / s;
-                  final short[] g = new short[n * n * m];
-                  for (int y = 0; y < m; y++) {
-                      for (int z = 0; z < n; z++) {
-                          for (int x = 0; x < n; x++) {
-                              short id = 0;
-                              int yTop = Math.min(c.h2 - 1, (y + 1) * s - 1);
-                              scan:
-                              for (int sy = yTop; sy >= y * s; sy--) {
-                                  for (int sz = z * s; sz < z * s + s && sz < 8; sz++) {
-                                      for (int sx = x * s; sx < x * s + s && sx < 8; sx++) {
-                                          short v = c.v[(sy * 8 + sz) * 8 + sx];
-                                          if (v != 0) { id = v; break scan; }
+                  final int s = 1 << L;                    // blocks per voxel
+                  final int n = Math.max(1, 16 >> L);      // voxels per side horizontally
+                  final int hocc = (c.hi - c.lo + 1) * 16; // occupied height in blocks
+                  final int m = hocc / s;                  // voxel rows
+
+                  // dense block-resolution copy of the occupied sections: index = (y*16 + z)*16 + x
+                  final short[] d = new short[16 * hocc * 16];
+                  for (int si = c.lo; si <= c.hi; si++) {
+                      Sec sec = c.secs[si];
+                      if (sec == null) continue;
+                      int base = (si - c.lo) * 4096;
+                      if (sec.wide == null && sec.idx == null) {
+                          short v = sec.pal[0];
+                          if (v != 0) Arrays.fill(d, base, base + 4096, v);
+                      } else {
+                          for (int i = 0; i < 4096; i++) d[base + i] = sec.get(i);
+                      }
+                  }
+
+                  // grid at this level: topmost non-air block inside each s*s*s cell
+                  final short[] g;
+                  if (L == 0) {
+                      g = d;
+                  } else {
+                      g = new short[n * n * m];
+                      for (int y = 0; y < m; y++) {
+                          for (int z = 0; z < n; z++) {
+                              for (int x = 0; x < n; x++) {
+                                  short id = 0;
+                                  scan:
+                                  for (int sy = (y + 1) * s - 1; sy >= y * s; sy--) {
+                                      for (int sz = z * s; sz < z * s + s; sz++) {
+                                          for (int sx = x * s; sx < x * s + s; sx++) {
+                                              short v = d[(sy * 16 + sz) * 16 + sx];
+                                              if (v != 0) { id = v; break scan; }
+                                          }
                                       }
                                   }
+                                  g[(y * n + z) * n + x] = id;
                               }
-                              g[(y * n + z) * n + x] = id;
                           }
                       }
                   }
-                  final float bs = 2f * s;
+
+                  final float bs = s;
+                  final float yBase = c.lo * 16f;
                   final short wid = waterId();
                   Out o = new Out();
                   int quads = 0;
@@ -466,21 +603,21 @@ jobs:
                               short id = g[(y * n + z) * n + x];
                               if (id == 0) continue;
                               boolean selfWater = id == wid;
-                              for (int d = 0; d < 6; d++) {
-                                  short nb = at(c, g, n, m, s, x + NB[d][0], y + NB[d][1], z + NB[d][2]);
+                              for (int dir = 0; dir < 6; dir++) {
+                                  short nb = at(c, g, n, m, s, x + NB[dir][0], y + NB[dir][1], z + NB[dir][2]);
                                   if (nb < 0) continue;
                                   if (nb != 0 && !(nb == wid && !selfWater)) continue;
-                                  FaceTex ft = face(id, d);
+                                  FaceTex ft = face(id, dir);
                                   if (!ft.ok) continue;
-                                  float sh = SHADE[d];
+                                  float sh = SHADE[dir];
                                   int r = (int) (((ft.rgb >> 16) & 255) * sh);
                                   int gg = (int) (((ft.rgb >> 8) & 255) * sh);
                                   int bb = (int) ((ft.rgb & 255) * sh);
                                   o.need(24 * 4);
                                   for (int k = 0; k < 4; k++) {
-                                      int[] cn = CORNERS[d][k];
+                                      int[] cn = CORNERS[dir][k];
                                       o.b.putFloat((x + cn[0]) * bs);
-                                      o.b.putFloat((y + cn[1]) * bs);
+                                      o.b.putFloat(yBase + (y + cn[1]) * bs);
                                       o.b.putFloat((z + cn[2]) * bs);
                                       o.b.putFloat(ft.u0 + CUV[k][0] * (ft.u1 - ft.u0));
                                       o.b.putFloat(ft.v0 + CUV[k][1] * (ft.v1 - ft.v0));
@@ -496,9 +633,11 @@ jobs:
               }
 
               // ---------------------------------------------------------------- level selection
+              /** 1 block per voxel for `fullDetailChunks` beyond vanilla distance, then 2, 4 and 8 blocks. */
               static int levelFor(int distChunks, int renderDist) {
                   int d = distChunks - renderDist;
-                  int l = d <= 6 ? 0 : d <= 14 ? 1 : d <= 26 ? 2 : 3;
+                  int f = cfg.fullDetailChunks;
+                  int l = d <= f ? 0 : d <= f + 8 ? 1 : d <= f + 20 ? 2 : 3;
                   l += cfg.detailBias;
                   return Math.max(0, Math.min(3, l));
               }
@@ -530,20 +669,25 @@ jobs:
               static void tick(Minecraft mc) {
                   if (mc.level == null || mc.player == null) {
                       if (lastLevel != null) { clearAll(); lastLevel = null; }
+                      updateFog(false);
                       return;
                   }
                   if (mc.level != lastLevel) { clearAll(); lastLevel = mc.level; }
-                  if (!cfg.enabled) { INGEST.clear(); return; }
+                  updateFog(cfg.enabled && cfg.disableFog);
+                  if (!cfg.enabled) { INGEST.clear(); curJob = null; return; }
 
-                  // 1) ingest loaded chunks, at most ~2 ms per tick
-                  long end = System.nanoTime() + 2_000_000L;
-                  LevelChunk ch;
-                  while (System.nanoTime() < end && (ch = INGEST.poll()) != null) {
-                      Col nc = ingest(mc.level, ch);
-                      long k = key(ch.getPos().x, ch.getPos().z);
-                      Col old = (nc == null) ? COLS.remove(k) : COLS.put(k, nc);
-                      if (old != null) { ramUsed -= old.bytes(); old.freeGpu(); }
-                      if (nc != null) ramUsed += nc.bytes();
+                  // 1) ingest loaded chunks one section at a time, about 3 ms per tick at most
+                  long end = System.nanoTime() + 3_000_000L;
+                  while (System.nanoTime() < end) {
+                      if (curJob == null) {
+                          LevelChunk ch = INGEST.poll();
+                          if (ch == null) break;
+                          curJob = new Job(mc.level, ch);
+                      }
+                      boolean done;
+                      try { done = curJob.step(); }
+                      catch (Throwable t) { System.err.println("[voxylod] ingest failed: " + t); done = true; curJob = null; continue; }
+                      if (done) { publish(curJob); curJob = null; }
                   }
 
                   final int px = ((int) Math.floor(mc.player.getX())) >> 4;
@@ -556,32 +700,40 @@ jobs:
                       list.sort((a, b) -> Long.compare(dist2(b, px, pz), dist2(a, px, pz)));
                       for (Col c : list) {
                           if (ramUsed <= budget * 0.9) break;
-                          if (COLS.remove(key(c.cx, c.cz), c)) { ramUsed -= c.bytes(); c.freeGpu(); }
+                          if (COLS.remove(key(c.cx, c.cz), c)) { ramUsed -= c.bytes; c.freeGpu(); }
                       }
                   }
 
-                  // 3) schedule meshing for columns whose wanted detail level changed
-                  int rd = mc.options.getEffectiveRenderDistance();
-                  int maxD = cfg.distanceChunks;
-                  for (Col c : COLS.values()) {
-                      if (inFlight.get() >= 2) break;
-                      int d = Math.max(Math.abs(c.cx - px), Math.abs(c.cz - pz));
-                      if (d > maxD || d <= rd - 1) continue;
-                      final int L = levelFor(d, rd);
-                      if (c.meshedLevel == L || c.queuedLevel == L || c.pending != null) continue;
-                      c.queuedLevel = L;
-                      inFlight.incrementAndGet();
-                      POOL.execute(() -> {
-                          try {
-                              c.pending = mesh(c, L);
-                          } catch (Throwable t) {
-                              System.err.println("[voxylod] mesh failed: " + t);
-                              c.pending = new PendingMesh(ByteBuffer.allocateDirect(0), 0, L);
-                          } finally {
-                              c.queuedLevel = -1;
-                              inFlight.decrementAndGet();
-                          }
-                      });
+                  // 3) schedule meshing, nearest columns first, for columns whose wanted detail level changed
+                  if (inFlight.get() < 2) {
+                      int rd = mc.options.getEffectiveRenderDistance();
+                      int maxD = cfg.distanceChunks;
+                      List<Col> todo = new ArrayList<>();
+                      for (Col c : COLS.values()) {
+                          int d = Math.max(Math.abs(c.cx - px), Math.abs(c.cz - pz));
+                          if (d > maxD || d <= rd - 1) continue;
+                          int L = levelFor(d, rd);
+                          if (c.meshedLevel == L || c.queuedLevel == L || c.pending != null) continue;
+                          todo.add(c);
+                      }
+                      todo.sort((a, b) -> Long.compare(dist2(a, px, pz), dist2(b, px, pz)));
+                      for (Col c : todo) {
+                          if (inFlight.get() >= 2) break;
+                          final int L = levelFor(Math.max(Math.abs(c.cx - px), Math.abs(c.cz - pz)), rd);
+                          c.queuedLevel = L;
+                          inFlight.incrementAndGet();
+                          POOL.execute(() -> {
+                              try {
+                                  c.pending = mesh(c, L);
+                              } catch (Throwable t) {
+                                  System.err.println("[voxylod] mesh failed: " + t);
+                                  c.pending = new PendingMesh(ByteBuffer.allocateDirect(0), 0, L);
+                              } finally {
+                                  c.queuedLevel = -1;
+                                  inFlight.decrementAndGet();
+                              }
+                          });
+                      }
                   }
               }
 
@@ -590,9 +742,29 @@ jobs:
                   return dx * dx + dz * dz;
               }
 
+              // ---------------------------------------------------------------- vanilla fog switch
+              static boolean fogForcedOff = false;
+              static String fogStatus = "untouched";
+              static void updateFog(boolean wantOff) {
+                  try {
+                      if (wantOff && !fogForcedOff) {
+                          if (FogControl.toggle()) FogControl.toggle();   // make sure vanilla fog ends up disabled
+                          fogForcedOff = true;
+                          fogStatus = "removed";
+                      } else if (!wantOff && fogForcedOff) {
+                          if (!FogControl.toggle()) FogControl.toggle();  // make sure vanilla fog ends up enabled
+                          fogForcedOff = false;
+                          fogStatus = "restored";
+                      }
+                  } catch (Throwable t) {
+                      fogForcedOff = wantOff;
+                      fogStatus = "error: " + t;
+                  }
+              }
+
               // ---------------------------------------------------------------- render
               static String lastRenderError = "none";
-              static int lastDrawn = 0, lastQuads = 0;
+              static int lastDrawn = 0, lastQuads = 0, lastCulled = 0;
 
               static void render(WorldRenderContext ctx) {
                   Minecraft mc = Minecraft.getInstance();
@@ -618,8 +790,15 @@ jobs:
 
                       Vec3 cam = ctx.worldState().cameraRenderState.pos;
                       PoseStack ms = ctx.matrices();
-                      Vec3 look = mc.player.getLookAngle();
-                      double lh = Math.hypot(look.x, look.z);
+                      // camera rotation: render-system model-view times the pose stack (camera-relative, no translation)
+                      Matrix4f view = new Matrix4f(RenderSystem.getModelViewMatrix()).mul(ms.last().pose());
+
+                      // frustum from our own projection (wide margin so FOV effects never clip LOD)
+                      float fovRad = (float) Math.toRadians(Math.min(160.0, mc.options.fov().get() + 30.0));
+                      float aspect = (float) mc.getWindow().getWidth() / (float) Math.max(1, mc.getWindow().getHeight());
+                      Matrix4f proj = new Matrix4f().perspective(fovRad, aspect, 0.05f, 100000f);
+                      FrustumIntersection frustum = new FrustumIntersection(new Matrix4f(proj).mul(view));
+
                       int rd = mc.options.getEffectiveRenderDistance();
                       int px = ((int) Math.floor(mc.player.getX())) >> 4;
                       int pz = ((int) Math.floor(mc.player.getZ())) >> 4;
@@ -627,20 +806,16 @@ jobs:
                       List<GpuBuffer> vbs = new ArrayList<>();
                       List<GpuBufferSlice> trs = new ArrayList<>();
                       List<Integer> counts = new ArrayList<>();
-                      int maxIdx = 0, totalQuads = 0;
+                      int maxIdx = 0, totalQuads = 0, culled = 0;
                       for (Col c : COLS.values()) {
                           if (c.vb == null || c.quads == 0) continue;
                           int d = Math.max(Math.abs(c.cx - px), Math.abs(c.cz - pz));
                           if (d > cfg.distanceChunks || d <= rd - 1) continue;
-                          double dx = c.cx * 16 + 8 - cam.x, dz = c.cz * 16 + 8 - cam.z;
-                          double dist = Math.hypot(dx, dz);
-                          if (dist > 40 && lh > 0.2) {
-                              double cos = (dx * look.x + dz * look.z) / (dist * lh);
-                              if (cos < -0.2) continue;
-                          }
-                          // camera rotation lives in the render system's model-view matrix; the pose stack adds the rest
-                          Matrix4f mv = new Matrix4f(RenderSystem.getModelViewMatrix())
-                              .mul(ms.last().pose())
+                          float x0 = (float) (c.cx * 16 - cam.x);
+                          float y0 = (float) (c.minY + c.lo * 16 - cam.y);
+                          float z0 = (float) (c.cz * 16 - cam.z);
+                          if (!frustum.testAab(x0, y0, z0, x0 + 16f, y0 + (c.hi - c.lo + 1) * 16f, z0 + 16f)) { culled++; continue; }
+                          Matrix4f mv = new Matrix4f(view)
                               .translate((float) (c.cx * 16 - cam.x), (float) (c.minY - cam.y), (float) (c.cz * 16 - cam.z));
                           GpuBufferSlice slice = RenderSystem.getDynamicUniforms()
                               .writeTransform(mv, new Vector4f(1f, 1f, 1f, 1f), new Vector3f(), new Matrix4f());
@@ -652,6 +827,7 @@ jobs:
                       }
                       lastDrawn = vbs.size();
                       lastQuads = totalQuads;
+                      lastCulled = culled;
                       if (vbs.isEmpty()) return;
 
                       var seq = RenderSystem.getSequentialBuffer(VertexFormat.Mode.QUADS);
@@ -680,14 +856,12 @@ jobs:
 
               /** Called when the settings screen is saved (or a command changes settings). */
               static void applyConfig() {
-                  cfg.distanceChunks = Math.max(4, Math.min(128, cfg.distanceChunks));
-                  cfg.ramBudgetMb = Math.max(16, Math.min(1024, cfg.ramBudgetMb));
-                  cfg.detailBias = Math.max(-1, Math.min(2, cfg.detailBias));
+                  clampCfg();
                   saveCfg();
                   if (!cfg.enabled) {
                       for (Col c : COLS.values()) c.freeGpu();   // meshedLevel becomes -1, so enabling again remeshes
                   } else {
-                      for (Col c : COLS.values()) c.meshedLevel = -2; // force remesh with the new detail bias
+                      for (Col c : COLS.values()) c.meshedLevel = -2; // force remesh with the new detail settings
                   }
               }
 
@@ -707,39 +881,51 @@ jobs:
                               ctx.getSource().sendFeedback(Component.literal(
                                   "[VoxyLod] " + (cfg.enabled ? "ON" : "OFF")
                                       + " | columns " + COLS.size() + " (meshed " + built + ")"
-                                      + " | drawn " + lastDrawn + " columns, " + lastQuads + " quads"
+                                      + " | drawn " + lastDrawn + " columns, " + lastQuads + " quads, culled " + lastCulled
                                       + " | RAM " + (ramUsed / 1048576L) + "/" + cfg.ramBudgetMb + " MB"
                                       + " | ingest queue " + INGEST.size() + " | jobs " + inFlight.get()
-                                      + " | distance " + cfg.distanceChunks
+                                      + " | distance " + cfg.distanceChunks + ", full detail +" + cfg.fullDetailChunks
+                                      + " | fog " + fogStatus
                                       + " | render error: " + lastRenderError));
                               return 1;
                           }))
                           .then(ClientCommandManager.literal("toggle").executes(ctx -> {
                               cfg.enabled = !cfg.enabled;
-                              if (!cfg.enabled) clearAll();
-                              saveCfg();
+                              applyConfig();
                               ctx.getSource().sendFeedback(Component.literal("[VoxyLod] " + (cfg.enabled ? "enabled" : "disabled")));
+                              return 1;
+                          }))
+                          .then(ClientCommandManager.literal("fog").executes(ctx -> {
+                              cfg.disableFog = !cfg.disableFog;
+                              applyConfig();
+                              ctx.getSource().sendFeedback(Component.literal("[VoxyLod] remove vanilla fog = " + cfg.disableFog));
                               return 1;
                           }))
                           .then(ClientCommandManager.literal("distance")
                               .then(ClientCommandManager.argument("chunks", IntegerArgumentType.integer(4, 128)).executes(ctx -> {
                                   cfg.distanceChunks = IntegerArgumentType.getInteger(ctx, "chunks");
-                                  saveCfg();
+                                  applyConfig();
                                   ctx.getSource().sendFeedback(Component.literal("[VoxyLod] distance = " + cfg.distanceChunks + " chunks"));
+                                  return 1;
+                              })))
+                          .then(ClientCommandManager.literal("full")
+                              .then(ClientCommandManager.argument("chunks", IntegerArgumentType.integer(0, 24)).executes(ctx -> {
+                                  cfg.fullDetailChunks = IntegerArgumentType.getInteger(ctx, "chunks");
+                                  applyConfig();
+                                  ctx.getSource().sendFeedback(Component.literal("[VoxyLod] full 1-block detail = " + cfg.fullDetailChunks + " chunks beyond vanilla"));
                                   return 1;
                               })))
                           .then(ClientCommandManager.literal("ram")
                               .then(ClientCommandManager.argument("mb", IntegerArgumentType.integer(16, 1024)).executes(ctx -> {
                                   cfg.ramBudgetMb = IntegerArgumentType.getInteger(ctx, "mb");
-                                  saveCfg();
+                                  applyConfig();
                                   ctx.getSource().sendFeedback(Component.literal("[VoxyLod] RAM budget = " + cfg.ramBudgetMb + " MB"));
                                   return 1;
                               })))
                           .then(ClientCommandManager.literal("detail")
                               .then(ClientCommandManager.argument("bias", IntegerArgumentType.integer(-1, 2)).executes(ctx -> {
                                   cfg.detailBias = IntegerArgumentType.getInteger(ctx, "bias");
-                                  saveCfg();
-                                  for (Col c : COLS.values()) c.meshedLevel = -2; // force remesh
+                                  applyConfig();
                                   ctx.getSource().sendFeedback(Component.literal("[VoxyLod] detail bias = " + cfg.detailBias + " (-1 sharper, +2 coarser)"));
                                   return 1;
                               })))));
@@ -806,6 +992,24 @@ jobs:
                       .setSaveConsumer(v -> c.detailBias = v)
                       .build());
 
+                  cat.addEntry(eb.startIntSlider(Component.literal("Full detail (chunks beyond vanilla)"), c.fullDetailChunks, 0, 24)
+                      .setDefaultValue(6)
+                      .setTooltip(Component.literal("How far past vanilla render distance the LOD uses 1 block per voxel. Beyond that it uses 2, 4 and 8 blocks. Higher looks better but costs FPS."))
+                      .setSaveConsumer(v -> c.fullDetailChunks = v)
+                      .build());
+
+                  cat.addEntry(eb.startIntSlider(Component.literal("Stored depth below surface (blocks)"), c.surfaceDepth, 8, 128)
+                      .setDefaultValue(32)
+                      .setTooltip(Component.literal("How deep under the surface LOD data is kept. Applies to chunks loaded after you change it."))
+                      .setSaveConsumer(v -> c.surfaceDepth = v)
+                      .build());
+
+                  cat.addEntry(eb.startBooleanToggle(Component.literal("Remove vanilla fog"), c.disableFog)
+                      .setDefaultValue(true)
+                      .setTooltip(Component.literal("Turns off vanilla distance fog while the LOD is enabled, so terrain does not fade out before the LOD starts."))
+                      .setSaveConsumer(v -> c.disableFog = v)
+                      .build());
+
                   cat.addEntry(eb.startIntSlider(Component.literal("RAM budget (MB)"), c.ramBudgetMb, 16, 1024)
                       .setDefaultValue(96)
                       .setTooltip(Component.literal("Memory for stored LOD data. The farthest columns are dropped when it is full."))
@@ -816,6 +1020,19 @@ jobs:
               }
           }
           VOXY_EOF_JAVA3
+          mkdir -p "$(dirname src/main/java/voxylod/FogControl.java)"
+          cat > src/main/java/voxylod/FogControl.java <<'VOXY_EOF_JAVA4'
+          package voxylod;
+
+          import net.minecraft.client.renderer.fog.FogRenderer;
+
+          /** Thin wrapper around the game's built-in fog on/off switch (the same one the debug key uses). */
+          final class FogControl {
+              private FogControl() {}
+              /** Flips vanilla fog and returns whether fog is enabled afterwards. */
+              static boolean toggle() { return FogRenderer.toggleFog(); }
+          }
+          VOXY_EOF_JAVA4
 
       - name: Build
         run: gradle build --no-daemon --stacktrace
@@ -823,4 +1040,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: voxylod-jar
-          path: build/libs/voxylod-0.1.0.jar
+          path: build/libs/voxylod-0.2.0.jar
