@@ -35,13 +35,21 @@ jobs:
           group = 'voxylod'
           base { archivesName = 'voxylod' }
 
-          repositories { mavenCentral() }
+          repositories {
+              mavenCentral()
+              maven { url = 'https://maven.shedaniel.me/' }
+              maven { url = 'https://maven.terraformersmc.com/releases/' }
+          }
 
           dependencies {
               minecraft "com.mojang:minecraft:1.21.11"
               mappings loom.officialMojangMappings()
               modImplementation "net.fabricmc:fabric-loader:0.18.2"
               modImplementation "net.fabricmc.fabric-api:fabric-api:0.141.1+1.21.11"
+              modImplementation "com.terraformersmc:modmenu:17.0.0"
+              modImplementation("me.shedaniel.cloth:cloth-config-fabric:21.11.153") {
+                  exclude(group: "net.fabricmc.fabric-api")
+              }
           }
 
           tasks.withType(JavaCompile).configureEach {
@@ -74,12 +82,19 @@ jobs:
             "name": "VoxyLod",
             "description": "Voxel LOD terrain with real block textures, built for low-end Android GPUs.",
             "environment": "client",
-            "entrypoints": { "client": ["voxylod.VoxyLodMod"] },
+            "entrypoints": {
+              "client": ["voxylod.VoxyLodMod"],
+              "modmenu": ["voxylod.VoxyLodModMenu"]
+            },
             "depends": {
               "fabricloader": ">=0.18.0",
               "minecraft": "~1.21.11",
               "java": ">=21",
               "fabric-api": "*"
+            },
+            "suggests": {
+              "modmenu": "*",
+              "cloth-config": "*"
             }
           }
           VOXY_EOF_MODJSON
@@ -623,7 +638,9 @@ jobs:
                               double cos = (dx * look.x + dz * look.z) / (dist * lh);
                               if (cos < -0.2) continue;
                           }
-                          Matrix4f mv = new Matrix4f(ms.last().pose())
+                          // camera rotation lives in the render system's model-view matrix; the pose stack adds the rest
+                          Matrix4f mv = new Matrix4f(RenderSystem.getModelViewMatrix())
+                              .mul(ms.last().pose())
                               .translate((float) (c.cx * 16 - cam.x), (float) (c.minY - cam.y), (float) (c.cz * 16 - cam.z));
                           GpuBufferSlice slice = RenderSystem.getDynamicUniforms()
                               .writeTransform(mv, new Vector4f(1f, 1f, 1f, 1f), new Vector3f(), new Matrix4f());
@@ -658,6 +675,19 @@ jobs:
                   } catch (Throwable t) {
                       // do not disable permanently: retry next frame
                       lastRenderError = t.toString();
+                  }
+              }
+
+              /** Called when the settings screen is saved (or a command changes settings). */
+              static void applyConfig() {
+                  cfg.distanceChunks = Math.max(4, Math.min(128, cfg.distanceChunks));
+                  cfg.ramBudgetMb = Math.max(16, Math.min(1024, cfg.ramBudgetMb));
+                  cfg.detailBias = Math.max(-1, Math.min(2, cfg.detailBias));
+                  saveCfg();
+                  if (!cfg.enabled) {
+                      for (Col c : COLS.values()) c.freeGpu();   // meshedLevel becomes -1, so enabling again remeshes
+                  } else {
+                      for (Col c : COLS.values()) c.meshedLevel = -2; // force remesh with the new detail bias
                   }
               }
 
@@ -716,6 +746,76 @@ jobs:
               }
           }
           VOXY_EOF_JAVA
+          mkdir -p "$(dirname src/main/java/voxylod/VoxyLodModMenu.java)"
+          cat > src/main/java/voxylod/VoxyLodModMenu.java <<'VOXY_EOF_JAVA2'
+          package voxylod;
+
+          import com.terraformersmc.modmenu.api.ConfigScreenFactory;
+          import com.terraformersmc.modmenu.api.ModMenuApi;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          /** Mod Menu entrypoint. Cloth Config classes live in a separate class so the game still runs without Cloth. */
+          public class VoxyLodModMenu implements ModMenuApi {
+              @Override
+              public ConfigScreenFactory<?> getModConfigScreenFactory() {
+                  return parent -> FabricLoader.getInstance().isModLoaded("cloth-config")
+                      ? VoxyLodConfigScreen.build(parent)
+                      : parent;
+              }
+          }
+          VOXY_EOF_JAVA2
+          mkdir -p "$(dirname src/main/java/voxylod/VoxyLodConfigScreen.java)"
+          cat > src/main/java/voxylod/VoxyLodConfigScreen.java <<'VOXY_EOF_JAVA3'
+          package voxylod;
+
+          import me.shedaniel.clothconfig2.api.ConfigBuilder;
+          import me.shedaniel.clothconfig2.api.ConfigCategory;
+          import me.shedaniel.clothconfig2.api.ConfigEntryBuilder;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          /** Cloth Config settings screen, opened from Mod Menu. */
+          public final class VoxyLodConfigScreen {
+              private VoxyLodConfigScreen() {}
+
+              public static Screen build(Screen parent) {
+                  VoxyLodMod.Config c = VoxyLodMod.cfg;
+                  ConfigBuilder b = ConfigBuilder.create()
+                      .setParentScreen(parent)
+                      .setTitle(Component.literal("VoxyLod Settings"))
+                      .setSavingRunnable(VoxyLodMod::applyConfig);
+                  ConfigEntryBuilder eb = b.entryBuilder();
+                  ConfigCategory cat = b.getOrCreateCategory(Component.literal("General"));
+
+                  cat.addEntry(eb.startBooleanToggle(Component.literal("Enable LOD"), c.enabled)
+                      .setDefaultValue(true)
+                      .setTooltip(Component.literal("Turns the LOD terrain on or off. Off frees the GPU memory it uses."))
+                      .setSaveConsumer(v -> c.enabled = v)
+                      .build());
+
+                  cat.addEntry(eb.startIntSlider(Component.literal("LOD distance (chunks)"), c.distanceChunks, 4, 128)
+                      .setDefaultValue(32)
+                      .setTooltip(Component.literal("How far the LOD is drawn. Higher uses more memory and GPU time."))
+                      .setSaveConsumer(v -> c.distanceChunks = v)
+                      .build());
+
+                  cat.addEntry(eb.startIntSlider(Component.literal("Detail bias"), c.detailBias, -1, 2)
+                      .setDefaultValue(0)
+                      .setTooltip(Component.literal("-1 = sharper detail, 0 = normal, +1/+2 = coarser and cheaper."))
+                      .setTextGetter(v -> Component.literal(v < 0 ? "Sharper" : v == 0 ? "Normal" : v == 1 ? "Coarser" : "Coarsest"))
+                      .setSaveConsumer(v -> c.detailBias = v)
+                      .build());
+
+                  cat.addEntry(eb.startIntSlider(Component.literal("RAM budget (MB)"), c.ramBudgetMb, 16, 1024)
+                      .setDefaultValue(96)
+                      .setTooltip(Component.literal("Memory for stored LOD data. The farthest columns are dropped when it is full."))
+                      .setSaveConsumer(v -> c.ramBudgetMb = v)
+                      .build());
+
+                  return b.build();
+              }
+          }
+          VOXY_EOF_JAVA3
 
       - name: Build
         run: gradle build --no-daemon --stacktrace
