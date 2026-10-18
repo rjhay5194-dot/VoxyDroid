@@ -1,0 +1,726 @@
+name: Build VoxyLod
+
+# One-file project: this workflow writes the whole Fabric 1.21.11 mod (sources, shaders,
+# gradle files) and builds the jar. Put this file at .github/workflows/build.yml in a repo,
+# push, then download the "voxylod-jar" artifact from the Actions tab.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.0
+
+      - name: Generate project files
+        run: |
+          mkdir -p "$(dirname build.gradle)"
+          cat > build.gradle <<'VOXY_EOF_GRADLE'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+          }
+
+          version = '0.1.0'
+          group = 'voxylod'
+          base { archivesName = 'voxylod' }
+
+          repositories { mavenCentral() }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:1.21.11"
+              mappings loom.officialMojangMappings()
+              modImplementation "net.fabricmc:fabric-loader:0.18.2"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:0.141.1+1.21.11"
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.release = 21
+              options.encoding = 'UTF-8'
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          VOXY_EOF_GRADLE
+          mkdir -p "$(dirname settings.gradle)"
+          cat > settings.gradle <<'VOXY_EOF_SETTINGS'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  gradlePluginPortal()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'voxylod'
+          VOXY_EOF_SETTINGS
+          mkdir -p "$(dirname src/main/resources/fabric.mod.json)"
+          cat > src/main/resources/fabric.mod.json <<'VOXY_EOF_MODJSON'
+          {
+            "schemaVersion": 1,
+            "id": "voxylod",
+            "version": "0.1.0",
+            "name": "VoxyLod",
+            "description": "Voxel LOD terrain with real block textures, built for low-end Android GPUs.",
+            "environment": "client",
+            "entrypoints": { "client": ["voxylod.VoxyLodMod"] },
+            "depends": {
+              "fabricloader": ">=0.18.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          VOXY_EOF_MODJSON
+          mkdir -p "$(dirname src/main/resources/assets/voxylod/shaders/core/lod.vsh)"
+          cat > src/main/resources/assets/voxylod/shaders/core/lod.vsh <<'VOXY_EOF_VSH'
+          #version 330
+
+          #moj_import <minecraft:dynamictransforms.glsl>
+          #moj_import <minecraft:projection.glsl>
+
+          in vec3 Position;
+          in vec2 UV0;
+          in vec4 Color;
+
+          out vec2 texCoord0;
+          out vec4 vertexColor;
+
+          void main() {
+              gl_Position = ProjMat * ModelViewMat * vec4(Position, 1.0);
+              texCoord0 = UV0;
+              vertexColor = Color;
+          }
+          VOXY_EOF_VSH
+          mkdir -p "$(dirname src/main/resources/assets/voxylod/shaders/core/lod.fsh)"
+          cat > src/main/resources/assets/voxylod/shaders/core/lod.fsh <<'VOXY_EOF_FSH'
+          #version 330
+
+          #moj_import <minecraft:dynamictransforms.glsl>
+
+          uniform sampler2D Sampler0;
+
+          in vec2 texCoord0;
+          in vec4 vertexColor;
+
+          out vec4 fragColor;
+
+          void main() {
+              vec4 color = texture(Sampler0, texCoord0) * vertexColor;
+              if (color.a < 0.1) {
+                  discard;
+              }
+              fragColor = color * ColorModulator;
+          }
+          VOXY_EOF_FSH
+          mkdir -p "$(dirname src/main/java/voxylod/VoxyLodMod.java)"
+          cat > src/main/java/voxylod/VoxyLodMod.java <<'VOXY_EOF_JAVA'
+          package voxylod;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import com.mojang.blaze3d.buffers.GpuBuffer;
+          import com.mojang.blaze3d.buffers.GpuBufferSlice;
+          import com.mojang.blaze3d.pipeline.RenderPipeline;
+          import com.mojang.blaze3d.pipeline.RenderTarget;
+          import com.mojang.blaze3d.systems.RenderPass;
+          import com.mojang.blaze3d.systems.RenderSystem;
+          import com.mojang.blaze3d.vertex.DefaultVertexFormat;
+          import com.mojang.blaze3d.vertex.PoseStack;
+          import com.mojang.blaze3d.vertex.VertexFormat;
+          import com.mojang.brigadier.arguments.IntegerArgumentType;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientChunkEvents;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
+          import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.multiplayer.ClientLevel;
+          import net.minecraft.client.renderer.RenderPipelines;
+          import net.minecraft.client.renderer.texture.AbstractTexture;
+          import net.minecraft.client.renderer.texture.TextureAtlas;
+          import net.minecraft.core.Direction;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.Identifier;
+          import net.minecraft.tags.FluidTags;
+          import net.minecraft.util.RandomSource;
+          import net.minecraft.world.level.block.Blocks;
+          import net.minecraft.world.level.block.LeavesBlock;
+          import net.minecraft.world.level.block.state.BlockState;
+          import net.minecraft.world.level.chunk.LevelChunk;
+          import net.minecraft.world.level.chunk.LevelChunkSection;
+          import net.minecraft.world.phys.Vec3;
+          import org.joml.Matrix4f;
+          import org.joml.Vector3f;
+          import org.joml.Vector4f;
+
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.nio.ByteBuffer;
+          import java.nio.ByteOrder;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.*;
+          import java.util.concurrent.ConcurrentHashMap;
+          import java.util.concurrent.ConcurrentLinkedQueue;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.atomic.AtomicInteger;
+
+          /**
+           * VoxyLod build 1: voxel LOD terrain with real block textures, drawn with plain
+           * vertex buffers (no compute shaders, no indirect draws) so it can run on GLES-class GPUs.
+           * Stored resolution is 2 blocks per voxel; far columns are meshed at 4, 8 and 16 blocks per voxel.
+           */
+          public class VoxyLodMod implements ClientModInitializer {
+              public static final String ID = "voxylod";
+
+              // ---------------------------------------------------------------- config
+              public static final class Config {
+                  public boolean enabled = true;
+                  public int distanceChunks = 32;   // how far LOD is drawn (chunks)
+                  public int ramBudgetMb = 96;      // memory for stored LOD voxels
+                  public int detailBias = 0;        // -1 sharper, +1 coarser
+              }
+              static Config cfg = new Config();
+              static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+              static Path cfgPath() { return FabricLoader.getInstance().getConfigDir().resolve("voxylod.json"); }
+              static void loadCfg() {
+                  try {
+                      Path p = cfgPath();
+                      if (Files.exists(p)) {
+                          try (Reader r = Files.newBufferedReader(p)) {
+                              Config c = GSON.fromJson(r, Config.class);
+                              if (c != null) cfg = c;
+                          }
+                      }
+                  } catch (Exception e) { System.err.println("[voxylod] config load failed: " + e); }
+                  cfg.distanceChunks = Math.max(4, Math.min(128, cfg.distanceChunks));
+                  cfg.ramBudgetMb = Math.max(16, Math.min(1024, cfg.ramBudgetMb));
+                  saveCfg();
+              }
+              static void saveCfg() {
+                  try (Writer w = Files.newBufferedWriter(cfgPath())) { GSON.toJson(cfg, w); }
+                  catch (Exception e) { System.err.println("[voxylod] config save failed: " + e); }
+              }
+
+              // ---------------------------------------------------------------- block palette
+              // id 0 = air / not drawn. Ids are shared by every column.
+              static final List<BlockState> PAL = new ArrayList<>();
+              static final Map<BlockState, Short> PAL_IDS = new HashMap<>();
+              static final Map<BlockState, Short> CLASS_CACHE = new HashMap<>();
+              static { PAL.add(Blocks.AIR.defaultBlockState()); }
+
+              /** Maps a real block state to a palette id, or 0 if it should not appear in the LOD. */
+              static synchronized short classify(BlockState s) {
+                  Short c = CLASS_CACHE.get(s);
+                  if (c != null) return c;
+                  short r = 0;
+                  if (!s.isAir()) {
+                      BlockState use = null;
+                      if (!s.getFluidState().isEmpty() && s.getFluidState().is(FluidTags.WATER) && !s.canOcclude()) {
+                          use = Blocks.WATER.defaultBlockState();
+                      } else if (s.canOcclude() || s.getBlock() instanceof LeavesBlock) {
+                          use = s;
+                      }
+                      if (use != null) {
+                          Short id = PAL_IDS.get(use);
+                          if (id == null) {
+                              id = (short) PAL.size();
+                              PAL.add(use);
+                              PAL_IDS.put(use, id);
+                          }
+                          r = id;
+                      }
+                  }
+                  CLASS_CACHE.put(s, r);
+                  return r;
+              }
+              static synchronized BlockState stateOf(int id) { return PAL.get(id); }
+
+              // ---------------------------------------------------------------- columns
+              /** One 16x16 chunk column stored at 2 blocks per voxel: index = (y*8 + z)*8 + x. */
+              static final class Col {
+                  final int cx, cz, minY, h2;
+                  final short[] v;
+                  volatile int meshedLevel = -1;   // level of the mesh currently on the GPU
+                  volatile int queuedLevel = -1;   // level currently being meshed
+                  volatile PendingMesh pending;    // finished mesh waiting for upload
+                  GpuBuffer vb;
+                  int quads;
+                  Col(int cx, int cz, int minY, int h2, short[] v) { this.cx = cx; this.cz = cz; this.minY = minY; this.h2 = h2; this.v = v; }
+                  long bytes() { return v.length * 2L; }
+                  void freeGpu() { if (vb != null) { vb.close(); vb = null; } quads = 0; meshedLevel = -1; }
+              }
+              static final class PendingMesh {
+                  final ByteBuffer data; final int quads; final int level;
+                  PendingMesh(ByteBuffer d, int q, int l) { data = d; quads = q; level = l; }
+              }
+
+              static final Map<Long, Col> COLS = new ConcurrentHashMap<>();
+              static long key(int x, int z) { return ((long) x << 32) ^ (z & 0xffffffffL); }
+              static long ramUsed = 0;
+
+              // ---------------------------------------------------------------- ingest
+              static final ConcurrentLinkedQueue<LevelChunk> INGEST = new ConcurrentLinkedQueue<>();
+              static ClientLevel lastLevel;
+
+              static Col ingest(ClientLevel level, LevelChunk ch) {
+                  int minY = level.getMinY();
+                  int h = level.getHeight();
+                  int h2 = (h + 1) / 2;
+                  short[] v = new short[64 * h2];
+                  LevelChunkSection[] secs = ch.getSections();
+                  boolean any = false;
+                  for (int si = 0; si < secs.length; si++) {
+                      LevelChunkSection sec = secs[si];
+                      if (sec == null || sec.hasOnlyAir()) continue;
+                      int cellBase = si * 8;
+                      for (int cy = 0; cy < 8; cy++) {
+                          int gy = cellBase + cy;
+                          if (gy >= h2) break;
+                          for (int cz = 0; cz < 8; cz++) {
+                              for (int cxx = 0; cxx < 8; cxx++) {
+                                  short id = 0;
+                                  scan:
+                                  for (int dy = 1; dy >= 0; dy--) {
+                                      for (int dz = 0; dz < 2; dz++) {
+                                          for (int dx = 0; dx < 2; dx++) {
+                                              BlockState s = sec.getBlockState(cxx * 2 + dx, cy * 2 + dy, cz * 2 + dz);
+                                              id = classify(s);
+                                              if (id != 0) break scan;
+                                          }
+                                      }
+                                  }
+                                  if (id != 0) { v[(gy * 8 + cz) * 8 + cxx] = id; any = true; }
+                              }
+                          }
+                      }
+                  }
+                  if (!any) return null;
+                  return new Col(ch.getPos().x, ch.getPos().z, minY, h2, v);
+              }
+
+              static void clearAll() {
+                  for (Col c : COLS.values()) c.freeGpu();
+                  COLS.clear();
+                  INGEST.clear();
+                  ramUsed = 0;
+              }
+
+              // ---------------------------------------------------------------- face textures
+              static final class FaceTex {
+                  float u0, v0, u1, v1;
+                  int rgb = 0xFFFFFF;
+                  boolean ok;
+              }
+              static final Map<Integer, FaceTex> FACES = new ConcurrentHashMap<>();
+              static final float[] SHADE = {0.5f, 1.0f, 0.8f, 0.8f, 0.6f, 0.6f}; // DOWN UP NORTH SOUTH WEST EAST
+              static volatile short waterId = -1;
+              static short waterId() {
+                  if (waterId < 0) waterId = classify(Blocks.WATER.defaultBlockState());
+                  return waterId;
+              }
+
+              static FaceTex face(int id, int dir) {
+                  int k = id * 6 + dir;
+                  FaceTex f = FACES.get(k);
+                  if (f == null) {
+                      f = computeFace(id, dir);
+                      FACES.put(k, f);
+                  }
+                  return f;
+              }
+
+              static FaceTex computeFace(int id, int dir) {
+                  FaceTex out = new FaceTex();
+                  try {
+                      BlockState st = stateOf(id);
+                      boolean water = id == waterId();
+                      BlockState src = water ? Blocks.WHITE_CONCRETE.defaultBlockState() : st;
+                      var model = Minecraft.getInstance().getBlockRenderer().getBlockModel(src);
+                      var parts = model.collectParts(RandomSource.create(42L));
+                      Direction d = Direction.values()[dir];
+                      float[] uv = null;
+                      int tintIdx = -1;
+                      search:
+                      for (int pass = 0; pass < 3; pass++) {
+                          for (var part : parts) {
+                              for (var q : part.getQuads(pass == 0 ? d : null)) {
+                                  if (pass == 1 && q.direction() != d) continue;
+                                  var spr = q.sprite();
+                                  uv = new float[]{spr.getU0(), spr.getV0(), spr.getU1(), spr.getV1()};
+                                  tintIdx = q.tintIndex();
+                                  break search;
+                              }
+                          }
+                      }
+                      if (uv != null) {
+                          out.u0 = uv[0]; out.v0 = uv[1]; out.u1 = uv[2]; out.v1 = uv[3];
+                          out.ok = true;
+                          if (water) out.rgb = 0x3F76E4;
+                          else if (tintIdx >= 0) out.rgb = (st.getBlock() instanceof LeavesBlock) ? 0x59AE30 : 0x79C05A;
+                      }
+                  } catch (Throwable t) {
+                      System.err.println("[voxylod] face lookup failed for state id " + id + ": " + t);
+                  }
+                  return out;
+              }
+
+              // ---------------------------------------------------------------- mesher
+              // corner positions (x,y,z in 0/1) per direction, ordered TL, BL, BR, TR as seen from outside
+              static final int[][][] CORNERS = {
+                  /* DOWN  */ {{0,0,1},{0,0,0},{1,0,0},{1,0,1}},
+                  /* UP    */ {{0,1,0},{0,1,1},{1,1,1},{1,1,0}},
+                  /* NORTH */ {{1,1,0},{1,0,0},{0,0,0},{0,1,0}},
+                  /* SOUTH */ {{0,1,1},{0,0,1},{1,0,1},{1,1,1}},
+                  /* WEST  */ {{0,1,0},{0,0,0},{0,0,1},{0,1,1}},
+                  /* EAST  */ {{1,1,1},{1,0,1},{1,0,0},{1,1,0}},
+              };
+              static final int[][] CUV = {{0,0},{0,1},{1,1},{1,0}};
+              static final int[][] NB = {{0,-1,0},{0,1,0},{0,0,-1},{0,0,1},{-1,0,0},{1,0,0}};
+
+              static final class Out {
+                  ByteBuffer b = ByteBuffer.allocateDirect(1 << 16).order(ByteOrder.nativeOrder());
+                  void need(int n) {
+                      if (b.remaining() >= n) return;
+                      ByteBuffer nb = ByteBuffer.allocateDirect(Math.max(b.capacity() * 2, b.capacity() + n)).order(ByteOrder.nativeOrder());
+                      b.flip();
+                      nb.put(b);
+                      b = nb;
+                  }
+              }
+
+              /** Value at grid cell (x,y,z) of column c at level L. -1 = solid and hidden, 0 = air, >0 = block id. */
+              static short at(Col c, short[] g, int n, int m, int s, int x, int y, int z) {
+                  if (y < 0) return -1;
+                  if (y >= m) return 0;
+                  if (x >= 0 && x < n && z >= 0 && z < n) return g[(y * n + z) * n + x];
+                  Col nc = COLS.get(key(c.cx + Math.floorDiv(x, n), c.cz + Math.floorDiv(z, n)));
+                  if (nc == null) return 0;
+                  int lx = (((x % n) + n) % n) * s;
+                  int lz = (((z % n) + n) % n) * s;
+                  int yy = Math.min(y * s, nc.h2 - 1);
+                  return nc.v[(yy * 8 + lz) * 8 + lx];
+              }
+
+              static PendingMesh mesh(Col c, int L) {
+                  final int s = 1 << L;
+                  final int n = Math.max(1, 8 >> L);
+                  final int m = (c.h2 + s - 1) / s;
+                  final short[] g = new short[n * n * m];
+                  for (int y = 0; y < m; y++) {
+                      for (int z = 0; z < n; z++) {
+                          for (int x = 0; x < n; x++) {
+                              short id = 0;
+                              int yTop = Math.min(c.h2 - 1, (y + 1) * s - 1);
+                              scan:
+                              for (int sy = yTop; sy >= y * s; sy--) {
+                                  for (int sz = z * s; sz < z * s + s && sz < 8; sz++) {
+                                      for (int sx = x * s; sx < x * s + s && sx < 8; sx++) {
+                                          short v = c.v[(sy * 8 + sz) * 8 + sx];
+                                          if (v != 0) { id = v; break scan; }
+                                      }
+                                  }
+                              }
+                              g[(y * n + z) * n + x] = id;
+                          }
+                      }
+                  }
+                  final float bs = 2f * s;
+                  final short wid = waterId();
+                  Out o = new Out();
+                  int quads = 0;
+                  for (int y = 0; y < m; y++) {
+                      for (int z = 0; z < n; z++) {
+                          for (int x = 0; x < n; x++) {
+                              short id = g[(y * n + z) * n + x];
+                              if (id == 0) continue;
+                              boolean selfWater = id == wid;
+                              for (int d = 0; d < 6; d++) {
+                                  short nb = at(c, g, n, m, s, x + NB[d][0], y + NB[d][1], z + NB[d][2]);
+                                  if (nb < 0) continue;
+                                  if (nb != 0 && !(nb == wid && !selfWater)) continue;
+                                  FaceTex ft = face(id, d);
+                                  if (!ft.ok) continue;
+                                  float sh = SHADE[d];
+                                  int r = (int) (((ft.rgb >> 16) & 255) * sh);
+                                  int gg = (int) (((ft.rgb >> 8) & 255) * sh);
+                                  int bb = (int) ((ft.rgb & 255) * sh);
+                                  o.need(24 * 4);
+                                  for (int k = 0; k < 4; k++) {
+                                      int[] cn = CORNERS[d][k];
+                                      o.b.putFloat((x + cn[0]) * bs);
+                                      o.b.putFloat((y + cn[1]) * bs);
+                                      o.b.putFloat((z + cn[2]) * bs);
+                                      o.b.putFloat(ft.u0 + CUV[k][0] * (ft.u1 - ft.u0));
+                                      o.b.putFloat(ft.v0 + CUV[k][1] * (ft.v1 - ft.v0));
+                                      o.b.put((byte) r).put((byte) gg).put((byte) bb).put((byte) 255);
+                                  }
+                                  quads++;
+                              }
+                          }
+                      }
+                  }
+                  o.b.flip();
+                  return new PendingMesh(o.b, quads, L);
+              }
+
+              // ---------------------------------------------------------------- level selection
+              static int levelFor(int distChunks, int renderDist) {
+                  int d = distChunks - renderDist;
+                  int l = d <= 6 ? 0 : d <= 14 ? 1 : d <= 26 ? 2 : 3;
+                  l += cfg.detailBias;
+                  return Math.max(0, Math.min(3, l));
+              }
+
+              // ---------------------------------------------------------------- pipeline
+              static final Identifier SHADER = Identifier.fromNamespaceAndPath(ID, "core/lod");
+              static final RenderPipeline PIPE = RenderPipelines.register(
+                  RenderPipeline.builder()
+                      .withLocation(Identifier.fromNamespaceAndPath(ID, "pipeline/lod"))
+                      .withVertexShader(SHADER)
+                      .withFragmentShader(SHADER)
+                      .withUniform("DynamicTransforms", com.mojang.blaze3d.shaders.UniformType.UNIFORM_BUFFER)
+                      .withUniform("Projection", com.mojang.blaze3d.shaders.UniformType.UNIFORM_BUFFER)
+                      .withSampler("Sampler0")
+                      .withVertexFormat(DefaultVertexFormat.POSITION_TEX_COLOR, VertexFormat.Mode.QUADS)
+                      .withCull(false)
+                      .withDepthBias(1.0f, 1.0f)
+                      .build());
+
+              // ---------------------------------------------------------------- worker + tick
+              static final AtomicInteger inFlight = new AtomicInteger();
+              static final ExecutorService POOL = Executors.newSingleThreadExecutor(r -> {
+                  Thread t = new Thread(r, "voxylod-mesh");
+                  t.setDaemon(true);
+                  t.setPriority(Thread.MIN_PRIORITY);
+                  return t;
+              });
+
+              static void tick(Minecraft mc) {
+                  if (mc.level == null || mc.player == null) {
+                      if (lastLevel != null) { clearAll(); lastLevel = null; }
+                      return;
+                  }
+                  if (mc.level != lastLevel) { clearAll(); lastLevel = mc.level; }
+                  if (!cfg.enabled) { INGEST.clear(); return; }
+
+                  // 1) ingest loaded chunks, at most ~2 ms per tick
+                  long end = System.nanoTime() + 2_000_000L;
+                  LevelChunk ch;
+                  while (System.nanoTime() < end && (ch = INGEST.poll()) != null) {
+                      Col nc = ingest(mc.level, ch);
+                      long k = key(ch.getPos().x, ch.getPos().z);
+                      Col old = (nc == null) ? COLS.remove(k) : COLS.put(k, nc);
+                      if (old != null) { ramUsed -= old.bytes(); old.freeGpu(); }
+                      if (nc != null) ramUsed += nc.bytes();
+                  }
+
+                  final int px = ((int) Math.floor(mc.player.getX())) >> 4;
+                  final int pz = ((int) Math.floor(mc.player.getZ())) >> 4;
+
+                  // 2) enforce the RAM budget: drop the farthest columns first
+                  long budget = cfg.ramBudgetMb * 1024L * 1024L;
+                  if (ramUsed > budget) {
+                      List<Col> list = new ArrayList<>(COLS.values());
+                      list.sort((a, b) -> Long.compare(dist2(b, px, pz), dist2(a, px, pz)));
+                      for (Col c : list) {
+                          if (ramUsed <= budget * 0.9) break;
+                          if (COLS.remove(key(c.cx, c.cz), c)) { ramUsed -= c.bytes(); c.freeGpu(); }
+                      }
+                  }
+
+                  // 3) schedule meshing for columns whose wanted detail level changed
+                  int rd = mc.options.getEffectiveRenderDistance();
+                  int maxD = cfg.distanceChunks;
+                  for (Col c : COLS.values()) {
+                      if (inFlight.get() >= 2) break;
+                      int d = Math.max(Math.abs(c.cx - px), Math.abs(c.cz - pz));
+                      if (d > maxD || d <= rd - 1) continue;
+                      final int L = levelFor(d, rd);
+                      if (c.meshedLevel == L || c.queuedLevel == L || c.pending != null) continue;
+                      c.queuedLevel = L;
+                      inFlight.incrementAndGet();
+                      POOL.execute(() -> {
+                          try {
+                              c.pending = mesh(c, L);
+                          } catch (Throwable t) {
+                              System.err.println("[voxylod] mesh failed: " + t);
+                              c.pending = new PendingMesh(ByteBuffer.allocateDirect(0), 0, L);
+                          } finally {
+                              c.queuedLevel = -1;
+                              inFlight.decrementAndGet();
+                          }
+                      });
+                  }
+              }
+
+              static long dist2(Col c, int px, int pz) {
+                  long dx = c.cx - px, dz = c.cz - pz;
+                  return dx * dx + dz * dz;
+              }
+
+              // ---------------------------------------------------------------- render
+              static String lastRenderError = "none";
+              static int lastDrawn = 0, lastQuads = 0;
+
+              static void render(WorldRenderContext ctx) {
+                  Minecraft mc = Minecraft.getInstance();
+                  if (!cfg.enabled || mc.level == null || mc.player == null || COLS.isEmpty()) return;
+                  try {
+                      // upload finished meshes (max 3 per frame)
+                      int ups = 0;
+                      for (Col c : COLS.values()) {
+                          if (ups >= 3) break;
+                          PendingMesh p = c.pending;
+                          if (p == null) continue;
+                          c.pending = null;
+                          GpuBuffer nvb = null;
+                          if (p.quads > 0) {
+                              nvb = RenderSystem.getDevice().createBuffer(() -> "voxylod column", GpuBuffer.USAGE_VERTEX, p.data);
+                          }
+                          if (c.vb != null) c.vb.close();
+                          c.vb = nvb;
+                          c.quads = p.quads;
+                          c.meshedLevel = p.level;
+                          ups++;
+                      }
+
+                      Vec3 cam = ctx.worldState().cameraRenderState.pos;
+                      PoseStack ms = ctx.matrices();
+                      Vec3 look = mc.player.getLookAngle();
+                      double lh = Math.hypot(look.x, look.z);
+                      int rd = mc.options.getEffectiveRenderDistance();
+                      int px = ((int) Math.floor(mc.player.getX())) >> 4;
+                      int pz = ((int) Math.floor(mc.player.getZ())) >> 4;
+
+                      List<GpuBuffer> vbs = new ArrayList<>();
+                      List<GpuBufferSlice> trs = new ArrayList<>();
+                      List<Integer> counts = new ArrayList<>();
+                      int maxIdx = 0, totalQuads = 0;
+                      for (Col c : COLS.values()) {
+                          if (c.vb == null || c.quads == 0) continue;
+                          int d = Math.max(Math.abs(c.cx - px), Math.abs(c.cz - pz));
+                          if (d > cfg.distanceChunks || d <= rd - 1) continue;
+                          double dx = c.cx * 16 + 8 - cam.x, dz = c.cz * 16 + 8 - cam.z;
+                          double dist = Math.hypot(dx, dz);
+                          if (dist > 40 && lh > 0.2) {
+                              double cos = (dx * look.x + dz * look.z) / (dist * lh);
+                              if (cos < -0.2) continue;
+                          }
+                          Matrix4f mv = new Matrix4f(ms.last().pose())
+                              .translate((float) (c.cx * 16 - cam.x), (float) (c.minY - cam.y), (float) (c.cz * 16 - cam.z));
+                          GpuBufferSlice slice = RenderSystem.getDynamicUniforms()
+                              .writeTransform(mv, new Vector4f(1f, 1f, 1f, 1f), new Vector3f(), new Matrix4f());
+                          vbs.add(c.vb);
+                          trs.add(slice);
+                          counts.add(c.quads * 6);
+                          maxIdx = Math.max(maxIdx, c.quads * 6);
+                          totalQuads += c.quads;
+                      }
+                      lastDrawn = vbs.size();
+                      lastQuads = totalQuads;
+                      if (vbs.isEmpty()) return;
+
+                      var seq = RenderSystem.getSequentialBuffer(VertexFormat.Mode.QUADS);
+                      GpuBuffer ibuf = seq.getBuffer(maxIdx);
+                      AbstractTexture atlas = mc.getTextureManager().getTexture(TextureAtlas.LOCATION_BLOCKS);
+                      RenderTarget rt = mc.getMainRenderTarget();
+                      try (RenderPass pass = RenderSystem.getDevice().createCommandEncoder().createRenderPass(
+                              () -> "voxylod", rt.getColorTextureView(), OptionalInt.empty(),
+                              rt.getDepthTextureView(), OptionalDouble.empty())) {
+                          pass.setPipeline(PIPE);
+                          pass.setUniform("Projection", RenderSystem.getProjectionMatrixBuffer());
+                          pass.bindTexture("Sampler0", atlas.getTextureView(), atlas.getSampler());
+                          pass.setIndexBuffer(ibuf, seq.type());
+                          for (int i = 0; i < vbs.size(); i++) {
+                              pass.setUniform("DynamicTransforms", trs.get(i));
+                              pass.setVertexBuffer(0, vbs.get(i));
+                              pass.drawIndexed(0, 0, counts.get(i), 1);
+                          }
+                      }
+                      lastRenderError = "none";
+                  } catch (Throwable t) {
+                      // do not disable permanently: retry next frame
+                      lastRenderError = t.toString();
+                  }
+              }
+
+              // ---------------------------------------------------------------- init + commands
+              @Override
+              public void onInitializeClient() {
+                  loadCfg();
+                  ClientChunkEvents.CHUNK_LOAD.register((level, chunk) -> { if (cfg.enabled) INGEST.add(chunk); });
+                  ClientTickEvents.END_CLIENT_TICK.register(VoxyLodMod::tick);
+                  WorldRenderEvents.BEFORE_TRANSLUCENT.register(VoxyLodMod::render);
+
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
+                      dispatcher.register(ClientCommandManager.literal("lod")
+                          .then(ClientCommandManager.literal("stats").executes(ctx -> {
+                              int built = 0;
+                              for (Col c : COLS.values()) if (c.vb != null) built++;
+                              ctx.getSource().sendFeedback(Component.literal(
+                                  "[VoxyLod] " + (cfg.enabled ? "ON" : "OFF")
+                                      + " | columns " + COLS.size() + " (meshed " + built + ")"
+                                      + " | drawn " + lastDrawn + " columns, " + lastQuads + " quads"
+                                      + " | RAM " + (ramUsed / 1048576L) + "/" + cfg.ramBudgetMb + " MB"
+                                      + " | ingest queue " + INGEST.size() + " | jobs " + inFlight.get()
+                                      + " | distance " + cfg.distanceChunks
+                                      + " | render error: " + lastRenderError));
+                              return 1;
+                          }))
+                          .then(ClientCommandManager.literal("toggle").executes(ctx -> {
+                              cfg.enabled = !cfg.enabled;
+                              if (!cfg.enabled) clearAll();
+                              saveCfg();
+                              ctx.getSource().sendFeedback(Component.literal("[VoxyLod] " + (cfg.enabled ? "enabled" : "disabled")));
+                              return 1;
+                          }))
+                          .then(ClientCommandManager.literal("distance")
+                              .then(ClientCommandManager.argument("chunks", IntegerArgumentType.integer(4, 128)).executes(ctx -> {
+                                  cfg.distanceChunks = IntegerArgumentType.getInteger(ctx, "chunks");
+                                  saveCfg();
+                                  ctx.getSource().sendFeedback(Component.literal("[VoxyLod] distance = " + cfg.distanceChunks + " chunks"));
+                                  return 1;
+                              })))
+                          .then(ClientCommandManager.literal("ram")
+                              .then(ClientCommandManager.argument("mb", IntegerArgumentType.integer(16, 1024)).executes(ctx -> {
+                                  cfg.ramBudgetMb = IntegerArgumentType.getInteger(ctx, "mb");
+                                  saveCfg();
+                                  ctx.getSource().sendFeedback(Component.literal("[VoxyLod] RAM budget = " + cfg.ramBudgetMb + " MB"));
+                                  return 1;
+                              })))
+                          .then(ClientCommandManager.literal("detail")
+                              .then(ClientCommandManager.argument("bias", IntegerArgumentType.integer(-1, 2)).executes(ctx -> {
+                                  cfg.detailBias = IntegerArgumentType.getInteger(ctx, "bias");
+                                  saveCfg();
+                                  for (Col c : COLS.values()) c.meshedLevel = -2; // force remesh
+                                  ctx.getSource().sendFeedback(Component.literal("[VoxyLod] detail bias = " + cfg.detailBias + " (-1 sharper, +2 coarser)"));
+                                  return 1;
+                              })))));
+              }
+          }
+          VOXY_EOF_JAVA
+
+      - name: Build
+        run: gradle build --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voxylod-jar
+          path: build/libs/voxylod-0.1.0.jar
