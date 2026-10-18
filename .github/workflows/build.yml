@@ -31,7 +31,7 @@ jobs:
               id 'fabric-loom' version '1.14-SNAPSHOT'
           }
 
-          version = '0.2.0'
+          version = '0.3.0'
           group = 'voxylod'
           base { archivesName = 'voxylod' }
 
@@ -78,10 +78,11 @@ jobs:
           {
             "schemaVersion": 1,
             "id": "voxylod",
-            "version": "0.2.0",
+            "version": "0.3.0",
             "name": "VoxyLod",
             "description": "Voxel LOD terrain with real block textures, built for low-end Android GPUs.",
             "environment": "client",
+            "mixins": ["voxylod.mixins.json"],
             "entrypoints": {
               "client": ["voxylod.VoxyLodMod"],
               "modmenu": ["voxylod.VoxyLodModMenu"]
@@ -172,6 +173,7 @@ jobs:
           import net.minecraft.resources.Identifier;
           import net.minecraft.tags.FluidTags;
           import net.minecraft.util.RandomSource;
+          import net.minecraft.world.level.Level;
           import net.minecraft.world.level.block.Blocks;
           import net.minecraft.world.level.block.LeavesBlock;
           import net.minecraft.world.level.block.state.BlockState;
@@ -199,7 +201,7 @@ jobs:
           import java.util.concurrent.atomic.AtomicInteger;
 
           /**
-           * VoxyLod build 2: full-resolution voxel LOD (1 block = 1 voxel near, 2/4/8 blocks farther out)
+           * VoxyLod build 3: full-resolution voxel LOD (1 block = 1 voxel near, 2/4/8 blocks farther out)
            * with real block textures, drawn with plain vertex buffers (no compute shaders, no indirect draws).
            */
           public class VoxyLodMod implements ClientModInitializer {
@@ -214,8 +216,14 @@ jobs:
                   public int fullDetailChunks = 6;   // chunks beyond vanilla distance drawn at 1 block per voxel
                   public int surfaceDepth = 32;      // blocks below the surface that are stored
                   public boolean disableFog = true;  // remove vanilla fog while LOD is on
+                  public int transitionOverlap = 1;  // chunks of LOD drawn underneath vanilla terrain to hide the seam
+                  public boolean ambientOcclusion = true;  // vanilla-style corner darkening on LOD faces
+                  public boolean dayNightShading = true;   // darken LOD at night like vanilla
               }
               static Config cfg = new Config();
+              /** Counts how often the fog mixin ran, so /lod stats can prove the hook works. */
+              public static volatile int fogHookHits = 0;
+              public static boolean fogActive() { return cfg.enabled && cfg.disableFog; }
               static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
               static Path cfgPath() { return FabricLoader.getInstance().getConfigDir().resolve("voxylod.json"); }
               static void clampCfg() {
@@ -224,6 +232,7 @@ jobs:
                   cfg.detailBias = Math.max(-1, Math.min(2, cfg.detailBias));
                   cfg.fullDetailChunks = Math.max(0, Math.min(24, cfg.fullDetailChunks));
                   cfg.surfaceDepth = Math.max(8, Math.min(128, cfg.surfaceDepth));
+                  cfg.transitionOverlap = Math.max(0, Math.min(3, cfg.transitionOverlap));
               }
               static void loadCfg() {
                   try {
@@ -547,6 +556,14 @@ jobs:
                   return nc.get(lx, c.minY + c.lo * 16 + y * s, lz);
               }
 
+              static final float[] AO_TABLE = {0.55f, 0.7f, 0.85f, 1.0f};
+
+              /** True if the voxel at grid cell (x,y,z) blocks light for ambient occlusion. */
+              static boolean occ(Col c, short[] g, int n, int m, int s, short wid, int x, int y, int z) {
+                  short v = at(c, g, n, m, s, x, y, z);
+                  return v < 0 || (v != 0 && v != wid);
+              }
+
               static PendingMesh mesh(Col c, int L) {
                   final int s = 1 << L;                    // blocks per voxel
                   final int n = Math.max(1, 16 >> L);      // voxels per side horizontally
@@ -595,6 +612,7 @@ jobs:
                   final float bs = s;
                   final float yBase = c.lo * 16f;
                   final short wid = waterId();
+                  final boolean useAo = cfg.ambientOcclusion;
                   Out o = new Out();
                   int quads = 0;
                   for (int y = 0; y < m; y++) {
@@ -610,18 +628,33 @@ jobs:
                                   FaceTex ft = face(id, dir);
                                   if (!ft.ok) continue;
                                   float sh = SHADE[dir];
-                                  int r = (int) (((ft.rgb >> 16) & 255) * sh);
-                                  int gg = (int) (((ft.rgb >> 8) & 255) * sh);
-                                  int bb = (int) ((ft.rgb & 255) * sh);
+                                  float br = ((ft.rgb >> 16) & 255) * sh;
+                                  float bg = ((ft.rgb >> 8) & 255) * sh;
+                                  float bb = (ft.rgb & 255) * sh;
+                                  final int na = dir < 2 ? 1 : dir < 4 ? 2 : 0;      // normal axis (0=x,1=y,2=z)
+                                  final int a1 = na == 0 ? 1 : 0;                     // tangent axes
+                                  final int a2 = na == 2 ? 1 : 2;
+                                  final int px = x + NB[dir][0], py = y + NB[dir][1], pz = z + NB[dir][2];
                                   o.need(24 * 4);
                                   for (int k = 0; k < 4; k++) {
                                       int[] cn = CORNERS[dir][k];
+                                      float ao = 1f;
+                                      if (useAo) {
+                                          int sg1 = cn[a1] == 1 ? 1 : -1, sg2 = cn[a2] == 1 ? 1 : -1;
+                                          int ox1 = a1 == 0 ? sg1 : 0, oy1 = a1 == 1 ? sg1 : 0, oz1 = a1 == 2 ? sg1 : 0;
+                                          int ox2 = a2 == 0 ? sg2 : 0, oy2 = a2 == 1 ? sg2 : 0, oz2 = a2 == 2 ? sg2 : 0;
+                                          boolean s1 = occ(c, g, n, m, s, wid, px + ox1, py + oy1, pz + oz1);
+                                          boolean s2 = occ(c, g, n, m, s, wid, px + ox2, py + oy2, pz + oz2);
+                                          boolean c3 = occ(c, g, n, m, s, wid, px + ox1 + ox2, py + oy1 + oy2, pz + oz1 + oz2);
+                                          int lvl = (s1 && s2) ? 0 : 3 - ((s1 ? 1 : 0) + (s2 ? 1 : 0) + (c3 ? 1 : 0));
+                                          ao = AO_TABLE[lvl];
+                                      }
                                       o.b.putFloat((x + cn[0]) * bs);
                                       o.b.putFloat(yBase + (y + cn[1]) * bs);
                                       o.b.putFloat((z + cn[2]) * bs);
                                       o.b.putFloat(ft.u0 + CUV[k][0] * (ft.u1 - ft.u0));
                                       o.b.putFloat(ft.v0 + CUV[k][1] * (ft.v1 - ft.v0));
-                                      o.b.put((byte) r).put((byte) gg).put((byte) bb).put((byte) 255);
+                                      o.b.put((byte) (br * ao)).put((byte) (bg * ao)).put((byte) (bb * ao)).put((byte) 255);
                                   }
                                   quads++;
                               }
@@ -654,7 +687,7 @@ jobs:
                       .withSampler("Sampler0")
                       .withVertexFormat(DefaultVertexFormat.POSITION_TEX_COLOR, VertexFormat.Mode.QUADS)
                       .withCull(false)
-                      .withDepthBias(1.0f, 1.0f)
+                      .withDepthBias(2.0f, 2.0f)
                       .build());
 
               // ---------------------------------------------------------------- worker + tick
@@ -669,11 +702,9 @@ jobs:
               static void tick(Minecraft mc) {
                   if (mc.level == null || mc.player == null) {
                       if (lastLevel != null) { clearAll(); lastLevel = null; }
-                      updateFog(false);
                       return;
                   }
                   if (mc.level != lastLevel) { clearAll(); lastLevel = mc.level; }
-                  updateFog(cfg.enabled && cfg.disableFog);
                   if (!cfg.enabled) { INGEST.clear(); curJob = null; return; }
 
                   // 1) ingest loaded chunks one section at a time, about 3 ms per tick at most
@@ -711,7 +742,7 @@ jobs:
                       List<Col> todo = new ArrayList<>();
                       for (Col c : COLS.values()) {
                           int d = Math.max(Math.abs(c.cx - px), Math.abs(c.cz - pz));
-                          if (d > maxD || d <= rd - 1) continue;
+                          if (d > maxD || insideVanilla(d, rd)) continue;
                           int L = levelFor(d, rd);
                           if (c.meshedLevel == L || c.queuedLevel == L || c.pending != null) continue;
                           todo.add(c);
@@ -737,32 +768,27 @@ jobs:
                   }
               }
 
+              /** LOD is skipped only well inside vanilla distance; the overlap hides the seam. */
+              static boolean insideVanilla(int d, int rd) { return d <= rd - 1 - cfg.transitionOverlap; }
+
               static long dist2(Col c, int px, int pz) {
                   long dx = c.cx - px, dz = c.cz - pz;
                   return dx * dx + dz * dz;
               }
 
-              // ---------------------------------------------------------------- vanilla fog switch
-              static boolean fogForcedOff = false;
-              static String fogStatus = "untouched";
-              static void updateFog(boolean wantOff) {
-                  try {
-                      if (wantOff && !fogForcedOff) {
-                          if (FogControl.toggle()) FogControl.toggle();   // make sure vanilla fog ends up disabled
-                          fogForcedOff = true;
-                          fogStatus = "removed";
-                      } else if (!wantOff && fogForcedOff) {
-                          if (!FogControl.toggle()) FogControl.toggle();  // make sure vanilla fog ends up enabled
-                          fogForcedOff = false;
-                          fogStatus = "restored";
-                      }
-                  } catch (Throwable t) {
-                      fogForcedOff = wantOff;
-                      fogStatus = "error: " + t;
-                  }
+              // ---------------------------------------------------------------- render
+              static float lastBrightness = 1f;
+
+              /** Approximate vanilla sky brightness: full by day, dark at night (overworld only). */
+              static float skyBrightness(Minecraft mc) {
+                  if (!cfg.dayNightShading || mc.level == null || mc.level.dimension() != Level.OVERWORLD) return 1f;
+                  long t = mc.level.getDayTime() % 24000L;
+                  if (t < 0) t += 24000L;
+                  double a = t / 24000.0 * Math.PI * 2.0;      // 0 = sunrise, 0.25 = noon, 0.5 = sunset
+                  float b = (float) Math.max(0.0, Math.min(1.0, Math.sin(a) * 2.0 + 0.5));
+                  return 0.28f + 0.72f * b;
               }
 
-              // ---------------------------------------------------------------- render
               static String lastRenderError = "none";
               static int lastDrawn = 0, lastQuads = 0, lastCulled = 0;
 
@@ -802,6 +828,8 @@ jobs:
                       int rd = mc.options.getEffectiveRenderDistance();
                       int px = ((int) Math.floor(mc.player.getX())) >> 4;
                       int pz = ((int) Math.floor(mc.player.getZ())) >> 4;
+                      final float sky = skyBrightness(mc);
+                      lastBrightness = sky;
 
                       List<GpuBuffer> vbs = new ArrayList<>();
                       List<GpuBufferSlice> trs = new ArrayList<>();
@@ -810,7 +838,7 @@ jobs:
                       for (Col c : COLS.values()) {
                           if (c.vb == null || c.quads == 0) continue;
                           int d = Math.max(Math.abs(c.cx - px), Math.abs(c.cz - pz));
-                          if (d > cfg.distanceChunks || d <= rd - 1) continue;
+                          if (d > cfg.distanceChunks || insideVanilla(d, rd)) continue;
                           float x0 = (float) (c.cx * 16 - cam.x);
                           float y0 = (float) (c.minY + c.lo * 16 - cam.y);
                           float z0 = (float) (c.cz * 16 - cam.z);
@@ -818,7 +846,7 @@ jobs:
                           Matrix4f mv = new Matrix4f(view)
                               .translate((float) (c.cx * 16 - cam.x), (float) (c.minY - cam.y), (float) (c.cz * 16 - cam.z));
                           GpuBufferSlice slice = RenderSystem.getDynamicUniforms()
-                              .writeTransform(mv, new Vector4f(1f, 1f, 1f, 1f), new Vector3f(), new Matrix4f());
+                              .writeTransform(mv, new Vector4f(sky, sky, sky, 1f), new Vector3f(), new Matrix4f());
                           vbs.add(c.vb);
                           trs.add(slice);
                           counts.add(c.quads * 6);
@@ -885,7 +913,8 @@ jobs:
                                       + " | RAM " + (ramUsed / 1048576L) + "/" + cfg.ramBudgetMb + " MB"
                                       + " | ingest queue " + INGEST.size() + " | jobs " + inFlight.get()
                                       + " | distance " + cfg.distanceChunks + ", full detail +" + cfg.fullDetailChunks
-                                      + " | fog " + fogStatus
+                                      + " | fog " + (fogActive() ? "removed (hook calls " + fogHookHits + ")" : "vanilla")
+                                      + " | overlap " + cfg.transitionOverlap + ", brightness " + String.format("%.2f", lastBrightness)
                                       + " | render error: " + lastRenderError));
                               return 1;
                           }))
@@ -1010,6 +1039,24 @@ jobs:
                       .setSaveConsumer(v -> c.disableFog = v)
                       .build());
 
+                  cat.addEntry(eb.startIntSlider(Component.literal("Transition overlap (chunks)"), c.transitionOverlap, 0, 3)
+                      .setDefaultValue(1)
+                      .setTooltip(Component.literal("LOD is also drawn this many chunks underneath the edge of vanilla terrain, so there is no gap or seam between them. Higher costs FPS."))
+                      .setSaveConsumer(v -> c.transitionOverlap = v)
+                      .build());
+
+                  cat.addEntry(eb.startBooleanToggle(Component.literal("Ambient occlusion shading"), c.ambientOcclusion)
+                      .setDefaultValue(true)
+                      .setTooltip(Component.literal("Vanilla-style darkening in block corners and crevices."))
+                      .setSaveConsumer(v -> c.ambientOcclusion = v)
+                      .build());
+
+                  cat.addEntry(eb.startBooleanToggle(Component.literal("Day / night shading"), c.dayNightShading)
+                      .setDefaultValue(true)
+                      .setTooltip(Component.literal("Darkens the LOD at night so it matches vanilla terrain."))
+                      .setSaveConsumer(v -> c.dayNightShading = v)
+                      .build());
+
                   cat.addEntry(eb.startIntSlider(Component.literal("RAM budget (MB)"), c.ramBudgetMb, 16, 1024)
                       .setDefaultValue(96)
                       .setTooltip(Component.literal("Memory for stored LOD data. The farthest columns are dropped when it is full."))
@@ -1020,19 +1067,80 @@ jobs:
               }
           }
           VOXY_EOF_JAVA3
-          mkdir -p "$(dirname src/main/java/voxylod/FogControl.java)"
-          cat > src/main/java/voxylod/FogControl.java <<'VOXY_EOF_JAVA4'
-          package voxylod;
+          mkdir -p "$(dirname src/main/java/voxylod/mixin/VoxyFogRendererMixin.java)"
+          cat > src/main/java/voxylod/mixin/VoxyFogRendererMixin.java <<'VOXY_EOF_JAVA4'
+          package voxylod.mixin;
 
+          import net.minecraft.client.renderer.fog.FogData;
           import net.minecraft.client.renderer.fog.FogRenderer;
+          import org.objectweb.asm.Opcodes;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Redirect;
+          import voxylod.VoxyLodMod;
 
-          /** Thin wrapper around the game's built-in fog on/off switch (the same one the debug key uses). */
-          final class FogControl {
-              private FogControl() {}
-              /** Flips vanilla fog and returns whether fog is enabled afterwards. */
-              static boolean toggle() { return FogRenderer.toggleFog(); }
+          /** Pushes the vanilla render-distance fog out of reach while the LOD is on. */
+          @Mixin(FogRenderer.class)
+          public class VoxyFogRendererMixin {
+              @Redirect(method = "setupFog", at = @At(value = "FIELD", target = "Lnet/minecraft/client/renderer/fog/FogData;renderDistanceStart:F", opcode = Opcodes.PUTFIELD))
+              private void voxylod$renderDistanceStart(FogData data, float renderDistanceStart) {
+                  if (VoxyLodMod.fogActive()) { data.renderDistanceStart = 1e5f; VoxyLodMod.fogHookHits++; }
+                  else data.renderDistanceStart = renderDistanceStart;
+              }
+
+              @Redirect(method = "setupFog", at = @At(value = "FIELD", target = "Lnet/minecraft/client/renderer/fog/FogData;renderDistanceEnd:F", opcode = Opcodes.PUTFIELD))
+              private void voxylod$renderDistanceEnd(FogData data, float renderDistanceEnd) {
+                  if (VoxyLodMod.fogActive()) data.renderDistanceEnd = 1e5f;
+                  else data.renderDistanceEnd = renderDistanceEnd;
+              }
           }
           VOXY_EOF_JAVA4
+          mkdir -p "$(dirname src/main/java/voxylod/mixin/VoxyAtmosphericFogMixin.java)"
+          cat > src/main/java/voxylod/mixin/VoxyAtmosphericFogMixin.java <<'VOXY_EOF_JAVA5'
+          package voxylod.mixin;
+
+          import net.minecraft.client.Camera;
+          import net.minecraft.client.DeltaTracker;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.multiplayer.ClientLevel;
+          import net.minecraft.client.renderer.fog.FogData;
+          import net.minecraft.client.renderer.fog.environment.AtmosphericFogEnvironment;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+          import voxylod.VoxyLodMod;
+
+          /** Removes the atmospheric (overworld / nether / end) fog too. Underwater, lava and effect fog are left alone. */
+          @Mixin(AtmosphericFogEnvironment.class)
+          public class VoxyAtmosphericFogMixin {
+              @Inject(at = @At("TAIL"), method = "setupFog(Lnet/minecraft/client/renderer/fog/FogData;Lnet/minecraft/client/Camera;Lnet/minecraft/client/multiplayer/ClientLevel;FLnet/minecraft/client/DeltaTracker;)V")
+              public void voxylod$tailSetupFog(FogData fogData, Camera camera, ClientLevel clientLevel, float viewDistance, DeltaTracker deltaTracker, CallbackInfo ci) {
+                  if (!VoxyLodMod.fogActive()) return;
+                  fogData.environmentalStart = 1e5f;
+                  fogData.environmentalEnd = 2e5f;
+                  fogData.skyEnd = viewDistance;
+                  fogData.cloudEnd = Minecraft.getInstance().options.cloudRange().get() * 16.0f;
+              }
+          }
+          VOXY_EOF_JAVA5
+          mkdir -p "$(dirname src/main/resources/voxylod.mixins.json)"
+          cat > src/main/resources/voxylod.mixins.json <<'VOXY_EOF_MIXINS'
+          {
+            "required": false,
+            "minVersion": "0.8",
+            "package": "voxylod.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "mixins": [],
+            "client": [
+              "VoxyFogRendererMixin",
+              "VoxyAtmosphericFogMixin"
+            ],
+            "injectors": {
+              "defaultRequire": 0
+            }
+          }
+          VOXY_EOF_MIXINS
 
       - name: Build
         run: gradle build --no-daemon --stacktrace
@@ -1040,4 +1148,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: voxylod-jar
-          path: build/libs/voxylod-0.2.0.jar
+          path: build/libs/voxylod-0.3.0.jar
